@@ -30,7 +30,7 @@ set -o pipefail
 #   check_system_performance     [2] 系统负载与性能（CPU/内存/Swap/IOWait/网络流量/进程）
 #   check_disk_filesystem        [3] 磁盘与文件系统（分区/inode/只读/错误/挂载/smartctl）
 #   check_network                [4] 网络（网卡/连通性/端口/防火墙/连接统计/主机名解析）
-#   check_app_services_host      [5] 应用服务巡检 - 主机（MySQL/Redis/Nginx/ActiveMQ/ES）
+#   check_app_services_host      [5] 应用服务巡检 - 主机（MySQL/Redis/Nginx/ActiveMQ/RocketMQ/ES）
 #   check_app_services_docker    [6] 应用服务巡检 - Docker 容器（按镜像名/容器名/端口识别）
 #   check_ssl_certificate_expiry [7] SSL 证书过期检查（nginx/httpd 配置 + 常见证书目录）
 #   check_log_inspection         [8] 日志巡检（自定义路径 + 自动发现 + journalctl）
@@ -1347,6 +1347,25 @@ check_app_services_host() {
         log "  ActiveMQ 未检测到运行"
     fi
 
+    # RocketMQ (host)
+    # 说明：RocketMQ 由 NameServer(9876) 与 Broker(10911) 组成，
+    #       主机版进程常见为 mqnamesrv / mqbroker，进程名可能带各种前缀。
+    #       所有命令均以 count_matching_procs / || true 兜底，即使未安装也不会中断巡检。
+    log "RocketMQ (host):"
+    local rmq_count
+    rmq_count=$(count_matching_procs 'rocketmq|mqnamesrv|mqbroker')
+    if [ "$rmq_count" -gt 0 ]; then
+        log "  RocketMQ 进程数量: $rmq_count"
+        log_matching_procs 'rocketmq|mqnamesrv|mqbroker'
+    else
+        log "  未检测到 RocketMQ 本地进程"
+    fi
+
+    if is_linux && cmd_exists ss; then
+        log "  检查 RocketMQ 端口 9876(NameServer)/10911(Broker) 状态:"
+        run_and_log_privileged ss -ltnp | grep -E ':9876|:10911' | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
+    fi
+
     # Elasticsearch
     log "Elasticsearch (host):"
     if cmd_exists curl; then
@@ -1369,7 +1388,7 @@ check_app_services_host() {
 # detect_service_from_image_or_name: 根据镜像名或容器名识别服务类型，返回小写标识符
 # 支持带任意前缀的镜像名（如 registry.example.com/mysql:8.0、myapp_redis 等），
 # 只要名称中包含对应的服务关键字即可识别
-# 返回值：mysql|redis|nginx|activemq|elasticsearch 或空字符串（未识别则走通用检查）
+# 返回值：mysql|redis|nginx|activemq|rocketmq|elasticsearch 或空字符串（未识别则走通用检查）
 detect_service_from_image_or_name() {
     local image="$1" name="$2"
     local combo
@@ -1387,6 +1406,11 @@ detect_service_from_image_or_name() {
     fi
     if echo "$combo" | grep -E -q '(^|[^a-z])(activemq)([^a-z]|$)'; then
         echo "activemq"; return
+    fi
+    # RocketMQ：镜像/容器名可能带任意前缀（如 rocketmq-nameserver、rocketmq-broker 等），
+    # 关键词覆盖 rocketmq / mqnamesrv / mqbroker / namesrv / broker，确保带前缀也能识别。
+    if echo "$combo" | grep -E -q '(^|[^a-z])(rocketmq|mqnamesrv|mqbroker|namesrv|broker)([^a-z]|$)'; then
+        echo "rocketmq"; return
     fi
     if echo "$combo" | grep -E -q '(^|[^a-z])(elastic|elasticsearch|\bes\b)([^a-z]|$)'; then
         echo "elasticsearch"; return
@@ -1454,6 +1478,18 @@ check_service_in_container() {
             else
                 log "  容器内 ActiveMQ 控制台不可达（可能未启用或需认证）"
             fi
+            ;;
+        rocketmq)
+            # RocketMQ：NameServer(9876)/Broker(10911)，容器内进程通常为 mqnamesrv/mqbroker。
+            # 先探测进程，再探测端口；所有命令均 || true 兜底，不中断巡检。
+            if "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'rocketmq|mqnamesrv|mqbroker' >/dev/null 2>&1; then
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'rocketmq|mqnamesrv|mqbroker' | head -n 10
+            else
+                log "  容器内未检测到 RocketMQ 进程，若容器内无 pgrep 则改用 ps 兼容识别"
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ps -ef | grep -E "rocketmq|mqnamesrv|mqbroker" | grep -v grep | head -n 10' || true
+            fi
+            log "  容器内 RocketMQ 端口监听情况 (9876/10911):"
+            run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ss -ltnp 2>/dev/null | grep -E ":9876|:10911" || true' || true
             ;;
         elasticsearch)
             if "${DOCKER_CMD[@]}" exec "$cid" curl -s --connect-timeout 3 --max-time 10 http://127.0.0.1:9200/ >/dev/null 2>&1; then
@@ -1570,6 +1606,9 @@ check_app_services_docker() {
             continue
         elif echo "$ports_json" | grep -q '8161\|61616'; then
             check_service_in_container "$cid" "activemq" "$img" "$name"
+            continue
+        elif echo "$ports_json" | grep -q '9876\|10911\|10909\|10912'; then
+            check_service_in_container "$cid" "rocketmq" "$img" "$name"
             continue
         fi
 
