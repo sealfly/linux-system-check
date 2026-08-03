@@ -1739,6 +1739,9 @@ check_app_services_docker() {
         elif echo "$ports_json" | grep -q '3306'; then
             check_service_in_container "$cid" "mysql" "$img" "$name"
             continue
+        elif echo "$ports_json" | grep -q '9092\|2181'; then
+            check_service_in_container "$cid" "kafka" "$img" "$name"
+            continue
         elif echo "$ports_json" | grep -q '8161\|61616'; then
             check_service_in_container "$cid" "activemq" "$img" "$name"
             continue
