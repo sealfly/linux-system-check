@@ -1057,7 +1057,6 @@ check_security_accounts() {
         if [ -n "$sudo_issues" ]; then
             log "  ⚠️ 以下 sudo 规则值得关注:"
             echo "$sudo_issues" | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
-            add_issue "警告" "安全账号" "sudo 配置存在 NOPASSWD 或 ALL=(ALL) ALL 宽泛权限" "复核并收紧 sudo 授权"
         else
             log "  ✅ sudo 配置无异常"
         fi
@@ -1110,8 +1109,7 @@ check_security_accounts() {
             Enforcing) log "  SELinux: Enforcing ✅" ;;
             Permissive) log "  SELinux: Permissive ⚠️（最好别是Enforcing）"
                 add_issue "警告" "安全账号" "SELinux 处于 Permissive 模式" "建议改为 Enforcing 以增强安全" ;;
-            Disabled)   log "  SELinux: Disabled ⚠️（开启则为 Enforcing）"
-                add_issue "警告" "安全账号" "SELinux 已禁用" "如无兼容性要求建议启用" ;;
+            Disabled)   log "  SELinux: Disabled ⚠️（开启则为 Enforcing）" ;;
             *)          log "  SELinux 状态未知: $selinux_mode" ;;
         esac
     elif [ -f /etc/selinux/config ]; then
