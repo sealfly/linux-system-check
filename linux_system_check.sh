@@ -30,7 +30,7 @@ set -o pipefail
 #   check_system_performance     [2] 系统负载与性能（CPU/内存/Swap/IOWait/网络流量/进程）
 #   check_disk_filesystem        [3] 磁盘与文件系统（分区/inode/只读/错误/挂载/smartctl）
 #   check_network                [4] 网络（网卡/连通性/端口/防火墙/连接统计/主机名解析）
-#   check_app_services_host      [5] 应用服务巡检 - 主机（MySQL/Redis/Nginx/ActiveMQ/RocketMQ/ES）
+#   check_app_services_host      [5] 应用服务巡检 - 主机（MySQL/Redis/Nginx/ActiveMQ/RocketMQ/Kafka/Petra/ES）
 #   check_app_services_docker    [6] 应用服务巡检 - Docker 容器（按镜像名/容器名/端口识别）
 #   check_ssl_certificate_expiry [7] SSL 证书过期检查（nginx/httpd 配置 + 常见证书目录）
 #   check_log_inspection         [8] 日志巡检（自定义路径 + 自动发现 + journalctl）
@@ -1366,6 +1366,36 @@ check_app_services_host() {
         run_and_log_privileged ss -ltnp | grep -E ':9876|:10911' | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
     fi
 
+    # Kafka (host)
+    log "Kafka (host):"
+    local kafka_count
+    kafka_count=$(count_matching_procs 'kafka|zookeeper|kafka-server|kafka-broker')
+    if [ "$kafka_count" -gt 0 ]; then
+        log "  Kafka 相关进程数量: $kafka_count"
+        log_matching_procs 'kafka|zookeeper|kafka-server|kafka-broker'
+    else
+        log "  未检测到 Kafka 本地进程"
+    fi
+    if is_linux && cmd_exists ss; then
+        log "  检查 Kafka 端口 9092(Broker)/2181(Zookeeper) 状态:"
+        run_and_log_privileged ss -ltnp | grep -E ':9092|:2181' | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
+    fi
+
+    # Petra (磐石系统) (host)
+    log "Petra (host):"
+    local petra_count
+    petra_count=$(count_matching_procs 'petra|磐石')
+    if [ "$petra_count" -gt 0 ]; then
+        log "  Petra 相关进程数量: $petra_count"
+        log_matching_procs 'petra|磐石'
+    else
+        log "  未检测到 Petra 本地进程"
+    fi
+    if is_linux && cmd_exists ss; then
+        log "  列出与 Petra 相关的监听端口（若无明确关键字则展示前 N 行监听）:"
+        run_and_log_privileged ss -ltnp | grep -i -E 'petra|磐石' || run_and_log_privileged ss -ltnp | head -n 20 || true
+    fi
+
     # Elasticsearch
     log "Elasticsearch (host):"
     if cmd_exists curl; then
@@ -1412,6 +1442,14 @@ detect_service_from_image_or_name() {
     # 注意：不使用裸 broker，因为 kafka/rabbitmq 镜像也常叫 xxx-broker，会误伤；rocketmq-broker 由 rocketmq 命中。
     if echo "$combo" | grep -E -q '(^|[^a-z])(rocketmq|mqnamesrv|mqbroker|namesrv|nameserver)([^a-z]|$)'; then
         echo "rocketmq"; return
+    fi
+    # Kafka：常见端口 9092（Broker）/2181（Zookeeper），镜像/容器名可能带前缀
+    if echo "$combo" | grep -E -q '(^|[^a-z])(kafka|zookeeper|kafka-server|kafka-broker)([^a-z]|$)'; then
+        echo "kafka"; return
+    fi
+    # Petra（磐石系统）：关键词 petra 或 磐石
+    if echo "$combo" | grep -E -q '(^|[^a-z])(petra|磐石)([^a-z]|$)'; then
+        echo "petra"; return
     fi
     if echo "$combo" | grep -E -q '(^|[^a-z])(elastic|elasticsearch|\bes\b)([^a-z]|$)'; then
         echo "elasticsearch"; return
@@ -1491,6 +1529,28 @@ check_service_in_container() {
             fi
             log "  容器内 RocketMQ 端口监听情况 (9876/10911):"
             run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ss -ltnp 2>/dev/null | grep -E ":9876|:10911" || true' || true
+            ;;
+        kafka)
+            # Kafka：Broker 9092，Zookeeper 2181。容器内常见进程为 kafka 或 zookeeper。
+            if "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'kafka|kafka-server|kafka-broker|zookeeper' >/dev/null 2>&1; then
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'kafka|kafka-server|kafka-broker|zookeeper' | head -n 10
+            else
+                log "  容器内未检测到 Kafka 相关进程，若容器内无 pgrep 则改用 ps 兼容识别"
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ps -ef | grep -E "kafka|kafka-server|kafka-broker|zookeeper" | grep -v grep | head -n 10' || true
+            fi
+            log "  容器内 Kafka 端口监听情况 (9092/2181):"
+            run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ss -ltnp 2>/dev/null | grep -E ":9092|:2181" || true' || true
+            ;;
+        petra)
+            # Petra（磐石系统）：容器内通常含 petra 进程或中文“磐石”。不假设固定端口，展示容器内相关进程与监听端口。
+            if "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'petra|磐石' >/dev/null 2>&1; then
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'petra|磐石' | head -n 10
+            else
+                log "  容器内未检测到 Petra 相关进程，若容器内无 pgrep 则改用 ps 兼容识别"
+                run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ps -ef | grep -E "petra|磐石" | grep -v grep | head -n 10' || true
+            fi
+            log "  容器内 Petra 相关端口监听情况（列出所有监听并过滤 petra 关键字）："
+            run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ss -ltnp 2>/dev/null | grep -i "petra\|磐石" || ss -ltnp 2>/dev/null | head -n 20' || true
             ;;
         elasticsearch)
             if "${DOCKER_CMD[@]}" exec "$cid" curl -s --connect-timeout 3 --max-time 10 http://127.0.0.1:9200/ >/dev/null 2>&1; then
