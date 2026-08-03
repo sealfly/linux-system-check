@@ -228,7 +228,7 @@ init() {
     log " | |____| | | | | | | | | |   <  __/"
     log " |______|_|_| |_| |_|_| |_|_|\\_\\___|"
     log "================================================"
-    log "  Linux 系统自动化运维巡检脚本（通用公开版）"
+    log "  Linux 系统自动化运维巡检脚本"
     log " 巡检时间: $(date '+%Y-%m-%d %H:%M:%S')"
     log " 主机名: $(hostname -f 2>/dev/null || hostname)"
     log " 日志目录: $LOG_DIR"
@@ -1349,7 +1349,7 @@ check_app_services_host() {
 
     # RocketMQ (host)
     # 说明：RocketMQ 由 NameServer(9876) 与 Broker(10911) 组成，
-    #       主机版进程常见为 mqnamesrv / mqbroker，进程名可能带各种前缀。
+    #       主机版进程常见为 mqnamesrv / mqbroker，镜像/进程名可能带各种前缀。
     #       所有命令均以 count_matching_procs / || true 兜底，即使未安装也不会中断巡检。
     log "RocketMQ (host):"
     local rmq_count
@@ -1418,7 +1418,7 @@ check_app_services_host() {
 # detect_service_from_image_or_name: 根据镜像名或容器名识别服务类型，返回小写标识符
 # 支持带任意前缀的镜像名（如 registry.example.com/mysql:8.0、myapp_redis 等），
 # 只要名称中包含对应的服务关键字即可识别
-# 返回值：mysql|redis|nginx|activemq|rocketmq|elasticsearch 或空字符串（未识别则走通用检查）
+# 返回值：mysql|redis|nginx|activemq|rocketmq|kafka|petra|elasticsearch 或空字符串（未识别则走通用检查）
 detect_service_from_image_or_name() {
     local image="$1" name="$2"
     local combo
@@ -1548,7 +1548,7 @@ check_service_in_container() {
             run_and_log "${DOCKER_CMD[@]}" exec "$cid" sh -c 'ss -ltnp 2>/dev/null | grep -E ":9876|:10911" || true' || true
             ;;
         kafka)
-            # Kafka：Broker 9092，Zookeeper 2181。容器内常见进程为 kafka 或 zookeeper。
+            # Kafka：Broker 9092，Zookeeper 2181。容器内常见进程为 kafka 或 zookeeper（若未内置 kafka 客户端则退为端口检查）。
             if "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'kafka|kafka-server|kafka-broker|zookeeper' >/dev/null 2>&1; then
                 run_and_log "${DOCKER_CMD[@]}" exec "$cid" pgrep -af 'kafka|kafka-server|kafka-broker|zookeeper' | head -n 10
             else
@@ -1728,10 +1728,16 @@ check_app_services_docker() {
             continue
         fi
 
-        # 进一步根据端口映射做启发式识别，如果镜像/容器名无法匹配，则根据常见端口识别
+        # 若未通过镜像/容器名匹配或模糊判断未通过，读取端口映射以做启发式识别
         ports_json=$("${DOCKER_CMD[@]}" inspect --format '{{json .NetworkSettings.Ports}}' "$cid" 2>/dev/null || echo "{}")
         if echo "$ports_json" | grep -q '9200'; then
             check_service_in_container "$cid" "elasticsearch" "$img" "$name"
+            continue
+        elif echo "$ports_json" | grep -q '6379'; then
+            check_service_in_container "$cid" "redis" "$img" "$name"
+            continue
+        elif echo "$ports_json" | grep -q '3306'; then
+            check_service_in_container "$cid" "mysql" "$img" "$name"
             continue
         elif echo "$ports_json" | grep -q '6379'; then
             check_service_in_container "$cid" "redis" "$img" "$name"
