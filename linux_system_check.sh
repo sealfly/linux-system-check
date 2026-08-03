@@ -46,12 +46,27 @@ LOG_DIR="${LOG_DIR:-/var/log/system_check}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/check_${TIMESTAMP}.log"
 
-# 阈值配置（后续可以根据需要扩展为报警阈值）
+# 阈值配置（用于巡检结论汇总的问题判断，可按需调整）
 CPU_THRESHOLD=80
 MEMORY_THRESHOLD=80
 DISK_THRESHOLD=80
 LOAD_THRESHOLD=10
 SSL_WARNING_DAYS=30
+SWAP_THRESHOLD=80
+IOWAIT_THRESHOLD=30
+TIME_OFFSET_THRESHOLD_SECONDS=10
+
+# 巡检结论登记机制：
+# ISSUES 数组记录巡检中发现的问题，元素格式 "级别|巡检项|描述|建议"
+# 级别：异常 / 警告 / 提示；print_summary() 在报告末尾输出总评与问题清单
+ISSUES=()
+
+add_issue() {
+    # 登记一个问题到结论清单（供报告末尾 print_summary 汇总）
+    # 用法：add_issue <级别> <巡检项> <描述> <建议>
+    local level="$1" item="$2" desc="$3" advice="$4"
+    ISSUES+=("${level}|${item}|${desc}|${advice}")
+}
 
 # 是否显示文件系统错误提示 (dmesg)：又臭又长，默认不显示。
 # 1=显示 dmesg 错误段；0=不显示（默认）。需要排查存储/磁盘问题时临时开启。
@@ -454,6 +469,32 @@ check_system_performance() {
     log "Swap 总量: $((swap_total/1024))MB, 已用: $((swap_used/1024))MB"
     log "IOWait: ${iowait}%"
 
+    # --- 阈值判断，登记到巡检结论 ---
+    if [ "$cpu_usage" -gt "$CPU_THRESHOLD" ]; then
+        add_issue "警告" "系统性能" "CPU 使用率 ${cpu_usage}% 超过阈值 ${CPU_THRESHOLD}%" "排查高占用进程，必要时扩容或优化"
+    fi
+    if [ "$mem_usage" -gt "$MEMORY_THRESHOLD" ]; then
+        add_issue "警告" "系统性能" "内存使用率 ${mem_usage}% 超过阈值 ${MEMORY_THRESHOLD}%" "排查内存占用进程，必要时扩容"
+    fi
+    if [ "$swap_total" -gt 0 ]; then
+        local swap_usage=$((swap_used * 100 / swap_total))
+        if [ "$swap_usage" -gt "$SWAP_THRESHOLD" ]; then
+            add_issue "警告" "系统性能" "Swap 使用率 ${swap_usage}% 超过阈值 ${SWAP_THRESHOLD}%" "内存可能不足，关注内存使用"
+        fi
+    fi
+    local load1
+    load1=$(echo "$load_avg" | awk -F'[, ]+' '{print $1}' 2>/dev/null || echo 0)
+    if [ -n "$load1" ]; then
+        local load_int
+        load_int=$(awk -v l="$load1" 'BEGIN { printf "%d", l }')
+        if [ "$load_int" -gt "$LOAD_THRESHOLD" ]; then
+            add_issue "警告" "系统性能" "系统负载(1分钟) ${load1} 超过阈值 ${LOAD_THRESHOLD}" "关注负载趋势，排查高负载进程"
+        fi
+    fi
+    if [ "$iowait" -gt "$IOWAIT_THRESHOLD" ]; then
+        add_issue "警告" "系统性能" "IOWait ${iowait}% 超过阈值 ${IOWAIT_THRESHOLD}%" "磁盘 I/O 可能成为瓶颈，检查磁盘健康与负载"
+    fi
+
     if cmd_exists iostat; then
         log "磁盘 I/O 性能 (iostat):"
         run_and_log iostat -dx 1 2 | tail -n 20
@@ -492,6 +533,16 @@ check_disk_filesystem() {
         else
             log "  ${mount} 未挂载或不可访问"
         fi
+        # 阈值判断：解析使用率并登记到巡检结论
+        local usage_line
+        usage_line=$(df -h "$mount" 2>/dev/null | tail -n +2 | head -n 1 || true)
+        if [ -n "$usage_line" ]; then
+            local usage_pct
+            usage_pct=$(echo "$usage_line" | awk '{print $5}' | tr -d '%')
+            if [ -n "$usage_pct" ] && [ "$usage_pct" -ge 0 ] 2>/dev/null && [ "$usage_pct" -gt "$DISK_THRESHOLD" ]; then
+                add_issue "警告" "磁盘文件系统" "分区 ${mount} 使用率 ${usage_pct}% 超过阈值 ${DISK_THRESHOLD}%" "清理无用文件或扩容"
+            fi
+        fi
     done
 
     log "inode 使用率:"
@@ -500,10 +551,24 @@ check_disk_filesystem() {
     else
         log "  无法获取 inode 使用率"
     fi
+    # inode 阈值判断（变量捕获代替进程替换，避免与 pipefail 冲突）
+    local inode_lines
+    inode_lines=$(df -hi 2>/dev/null | tail -n +2 || true)
+    if [ -n "$inode_lines" ]; then
+        while IFS= read -r inode_line; do
+            [ -z "$inode_line" ] && continue
+            local inode_pct
+            inode_pct=$(echo "$inode_line" | awk '{print $5}' | tr -d '%')
+            if [ -n "$inode_pct" ] && [ "$inode_pct" -ge 0 ] 2>/dev/null && [ "$inode_pct" -gt "$DISK_THRESHOLD" ]; then
+                add_issue "警告" "磁盘文件系统" "inode 使用率 ${inode_pct}% 超过阈值 ${DISK_THRESHOLD}%" "清理小文件或扩展 inode 容量"
+            fi
+        done <<< "$inode_lines"
+    fi
 
     log "只读文件系统检查:"
     if mount | grep -E ' ro(,|$)' >/dev/null 2>&1; then
         mount | grep -E ' ro(,|$)' | while IFS= read -r line; do echo "$line" | tee -a "$LOG_FILE"; done
+        add_issue "警告" "磁盘文件系统" "存在只读挂载点，可能影响写入" "检查挂载状态，必要时重新挂载为读写"
     else
         log "  无只读挂载点"
     fi
@@ -583,6 +648,7 @@ check_network() {
             log "  网关可达"
         else
             log "  无法到达网关"
+            add_issue "异常" "网络" "无法 ping 通默认网关 ${gateway}" "检查网卡状态、IP 配置与链路"
         fi
     else
         log "  未检测到默认网关，跳过网关连通性检测"
@@ -594,6 +660,7 @@ check_network() {
             log "  $target 可达"
         else
             log "  无法访问 $target"
+            add_issue "警告" "网络" "无法访问外网目标 ${target}" "检查出口路由、DNS 与防火墙策略"
         fi
     done
 
@@ -772,8 +839,10 @@ check_ssl_certificate_expiry() {
         local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
         if [ "$days_left" -lt 0 ]; then
             log "  $cert_path: 已过期，剩余天数 $days_left"
+            add_issue "异常" "SSL 证书" "证书已过期: $cert_path (剩余 ${days_left} 天)" "立即更换证书，否则服务会受影响"
         elif [ "$days_left" -lt "$SSL_WARNING_DAYS" ]; then
             log "  $cert_path: 即将过期，剩余 $days_left 天"
+            add_issue "警告" "SSL 证书" "证书即将过期: $cert_path (剩余 ${days_left} 天)" "尽快安排证书续期"
         else
             log "  $cert_path: 证书剩余 $days_left 天"
         fi
@@ -946,11 +1015,13 @@ check_security_accounts() {
         if [ -n "$permit_root" ]; then
             case "$permit_root" in
                 no|prohibit-password) log "  PermitRootLogin=$permit_root ✅ 已限制" ;;
-                yes|without-password) log "  PermitRootLogin=$permit_root ⚠️ 建议改为 prohibit-password 或 no" ;;
+                yes|without-password) log "  PermitRootLogin=$permit_root ⚠️ 建议改为 prohibit-password 或 no"
+                    add_issue "警告" "安全账号" "sshd 允许 root 密码登录 (PermitRootLogin=$permit_root)" "建议改为 prohibit-password 或 no" ;;
                 *)                     log "  PermitRootLogin=$permit_root (非标准值)" ;;
             esac
         else
             log "  $cfg 中未显式配置 PermitRootLogin（默认允许密码登录）⚠️"
+            add_issue "提示" "安全账号" "$cfg 未显式配置 PermitRootLogin（默认允许密码登录）" "建议显式配置为 prohibit-password"
         fi
     done
     if [ "$sshd_config_found" -eq 0 ]; then
@@ -967,6 +1038,7 @@ check_security_accounts() {
         if [ -n "$empty_pw" ]; then
             log "  ⚠️ 以下账号无密码或锁定但 shell 可用:"
             echo "$empty_pw" | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
+            add_issue "异常" "安全账号" "存在空口令或密码锁定但 shell 可用的账号" "立即为这些账号设置强密码或禁用"
         else
             log "  ✅ 未发现空口令风险账号"
         fi
@@ -985,6 +1057,7 @@ check_security_accounts() {
         if [ -n "$sudo_issues" ]; then
             log "  ⚠️ 以下 sudo 规则值得关注:"
             echo "$sudo_issues" | while IFS= read -r line; do echo "    $line" | tee -a "$LOG_FILE"; done || true
+            add_issue "警告" "安全账号" "sudo 配置存在 NOPASSWD 或 ALL=(ALL) ALL 宽泛权限" "复核并收紧 sudo 授权"
         else
             log "  ✅ sudo 配置无异常"
         fi
@@ -1035,8 +1108,10 @@ check_security_accounts() {
         selinux_mode=$(getenforce 2>/dev/null || true)
         case "$selinux_mode" in
             Enforcing) log "  SELinux: Enforcing ✅" ;;
-            Permissive) log "  SELinux: Permissive ⚠️（最好别是Enforcing）" ;;
-            Disabled)   log "  SELinux: Disabled ⚠️（开启则为 Enforcing）" ;;
+            Permissive) log "  SELinux: Permissive ⚠️（最好别是Enforcing）"
+                add_issue "警告" "安全账号" "SELinux 处于 Permissive 模式" "建议改为 Enforcing 以增强安全" ;;
+            Disabled)   log "  SELinux: Disabled ⚠️（开启则为 Enforcing）"
+                add_issue "警告" "安全账号" "SELinux 已禁用" "如无兼容性要求建议启用" ;;
             *)          log "  SELinux 状态未知: $selinux_mode" ;;
         esac
     elif [ -f /etc/selinux/config ]; then
@@ -1202,6 +1277,7 @@ check_time_sync() {
         log "  ⚠️ 未检测到任何运行中的 NTP 时间同步服务"
         log "  常见排查: systemctl start chronyd && systemctl enable chronyd"
         log "  或手动同步: ntpdate -u pool.ntp.org (需要 ntpdate 包)"
+        add_issue "警告" "时间同步" "未检测到运行中的 NTP 时间同步服务" "启用 chronyd/ntpd/timesyncd 并配置上游"
     fi
 
     # --- 10.4 时间偏差检查 ---
@@ -1218,6 +1294,12 @@ check_time_sync() {
         chrony_offset=$(chronyc tracking 2>/dev/null | awk '/System time/ {print $4}' || true)
         if [ -n "$chrony_offset" ]; then
             log "    chronyd 系统时间偏差: ${chrony_offset} 秒"
+            local offset_abs offset_bad
+            offset_abs=$(awk -v o="$chrony_offset" 'BEGIN { if (o<0) o=-o; printf "%.6f", o }')
+            offset_bad=$(awk -v o="$offset_abs" -v t="$TIME_OFFSET_THRESHOLD_SECONDS" 'BEGIN { printf "%d", (o>t) ? 1 : 0 }')
+            if [ "$offset_bad" -eq 1 ]; then
+                add_issue "警告" "时间同步" "chronyd 时间偏差 ${chrony_offset} 秒超过阈值 ${TIME_OFFSET_THRESHOLD_SECONDS} 秒" "检查 NTP 服务与网络，必要时手动同步"
+            fi
         fi
     fi
 
@@ -1234,7 +1316,8 @@ check_time_sync() {
         if [ -n "$ntp_sync" ]; then
             case "$ntp_sync" in
                 yes) log "    NTP 同步: 已同步 ✅" ;;
-                no)  log "    NTP 同步: 未同步 ⚠️" ;;
+                no)  log "    NTP 同步: 未同步 ⚠️"
+                    add_issue "警告" "时间同步" "timedatectl 显示 NTP 未同步" "检查 NTP 服务与上游配置" ;;
                 *)   log "    NTP 同步: $ntp_sync" ;;
             esac
         fi
@@ -1260,6 +1343,46 @@ check_time_sync() {
     log "[时间] 时间同步巡检完成"
 }
 
+print_summary() {
+    # 报告末尾输出巡检结论汇总：总评 + 问题清单
+    # 总评规则：存在"异常"项 → 存在异常；无异常但有"警告" → 需关注；否则 → 正常
+    local cnt_err=0 cnt_warn=0 cnt_info=0
+    local issue
+    for issue in "${ISSUES[@]}"; do
+        case "${issue%%|*}" in
+            异常) cnt_err=$((cnt_err + 1)) ;;
+            警告) cnt_warn=$((cnt_warn + 1)) ;;
+            提示) cnt_info=$((cnt_info + 1)) ;;
+        esac
+    done
+
+    log_section "巡检结论汇总"
+    local overall="正常"
+    if [ "$cnt_err" -gt 0 ]; then
+        overall="存在异常"
+    elif [ "$cnt_warn" -gt 0 ]; then
+        overall="需关注"
+    fi
+    log "整体状态: ${overall}（异常 ${cnt_err} 项 / 警告 ${cnt_warn} 项 / 提示 ${cnt_info} 项）"
+    log "------------------------------------------------------------"
+
+    if [ "${#ISSUES[@]}" -eq 0 ]; then
+        log "未发现异常，系统运行正常 ✅"
+        return 0
+    fi
+
+    local idx=0
+    local level item desc advice
+    for issue in "${ISSUES[@]}"; do
+        idx=$((idx + 1))
+        IFS='|' read -r level item desc advice <<< "$issue"
+        log "[$idx] [${level}] [${item}] ${desc}"
+        if [ -n "$advice" ]; then
+            log "      建议: ${advice}"
+        fi
+    done
+}
+
 main() {
     # 主巡检入口：按顺序执行各检查小节
     # 每个检查都加 || true 兜底：即使某个小节内部出现意外失败（返回非零），
@@ -1280,6 +1403,9 @@ main() {
     check_log_inspection || true
     check_security_accounts || true
     check_time_sync || true
+
+    # --- 巡检结论汇总（总评 + 问题清单） ---
+    print_summary || true
 
     log ""
     log "========================================"
@@ -1712,6 +1838,7 @@ check_app_services_docker() {
                     check_service_in_container "$cid" "$service" "$img" "$name"
                 else
                     log "  模糊匹配 $service 但二次证据不足，记录为待人工复核（跳过专有检查）"
+                    add_issue "提示" "Docker 服务" "容器 $name ($cid) 模糊匹配到 ${service} 但端口/进程证据不足" "人工确认容器实际运行的服务类型"
                 fi
                 continue
             fi
