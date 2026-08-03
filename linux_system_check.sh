@@ -1451,6 +1451,23 @@ detect_service_from_image_or_name() {
     if echo "$combo" | grep -E -q '(^|[^a-z])(petra|磐石)([^a-z]|$)'; then
         echo "petra"; return
     fi
+
+    # ----- 宽松子串回退匹配（fallback loose matching） -----
+    # 如果严格边界匹配未命中，则尝试更宽松的子串匹配，但将以 possible: 前缀返回，
+    # 表示需要二次证据（端口/进程/inspect）来确认以避免误报。
+    if echo "$combo" | grep -qi 'rocketmq\|mqnamesrv\|mqbroker\|namesrv\|nameserver'; then
+        echo "possible:rocketmq"; return
+    fi
+    if echo "$combo" | grep -qi 'activemq'; then
+        echo "possible:activemq"; return
+    fi
+    if echo "$combo" | grep -qi 'kafka\|zookeeper\|kafka-server\|kafka-broker'; then
+        echo "possible:kafka"; return
+    fi
+    if echo "$combo" | grep -qi 'petra\|磐石'; then
+        echo "possible:petra"; return
+    fi
+
     if echo "$combo" | grep -E -q '(^|[^a-z])(elastic|elasticsearch|\bes\b)([^a-z]|$)'; then
         echo "elasticsearch"; return
     fi
@@ -1650,6 +1667,63 @@ check_app_services_docker() {
         # 先基于镜像名/容器名关键词识别服务类型
         svc=$(detect_service_from_image_or_name "$img" "$name")
         if [ -n "$svc" ]; then
+            # 如果 detect 返回 possible: 开头，表示是宽松子串匹配，需要二次证据（端口/进程/inspect）确认
+            if echo "$svc" | grep -q '^possible:'; then
+                service="${svc#possible:}"
+                log "  模糊匹配到服务名称: $service（来自镜像/容器名），尝试二次证据确认..."
+                evidence=0
+                # 先检查端口映射（快速）
+                ports_json=$("${DOCKER_CMD[@]}" inspect --format '{{json .NetworkSettings.Ports}}' "$cid" 2>/dev/null || echo "{}")
+                case "$service" in
+                    rocketmq)
+                        if echo "$ports_json" | grep -q '9876\|10911\|10909\|10912'; then evidence=1; fi
+                        pattern='rocketmq|mqnamesrv|mqbroker'
+                        ;;
+                    activemq)
+                        if echo "$ports_json" | grep -q '8161\|61616'; then evidence=1; fi
+                        pattern='activemq'
+                        ;;
+                    kafka)
+                        if echo "$ports_json" | grep -q '9092\|2181'; then evidence=1; fi
+                        pattern='kafka|zookeeper|kafka-server|kafka-broker'
+                        ;;
+                    petra)
+                        # Petra 无固定端口，使用更宽松的进程/inspect 检查
+                        pattern='petra|磐石'
+                        ;;
+                    *)
+                        pattern="$service"
+                        ;;
+                esac
+
+                # 若端口映射未给出证据，尝试 inspect + 容器内进程检查
+                if [ "$evidence" -eq 0 ]; then
+                    # 检查 docker inspect 内容（image, cmd, env, labels）是否包含关键字
+                    if "${DOCKER_CMD[@]}" inspect "$cid" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -q "$service"; then
+                        evidence=1
+                    else
+                        # 尝试容器内进程匹配（若容器可执行 pgrep 或 ps）
+                        if "${DOCKER_CMD[@]}" exec "$cid" pgrep -af "$pattern" >/dev/null 2>&1; then
+                            evidence=1
+                        else
+                            # 退回到 ps grep 兼容方式
+                            if "${DOCKER_CMD[@]}" exec "$cid" sh -c "ps -ef 2>/dev/null | grep -E \"$pattern\" | grep -v grep >/dev/null 2>&1"; then
+                                evidence=1
+                            fi
+                        fi
+                    fi
+                fi
+
+                if [ "$evidence" -eq 1 ]; then
+                    log "  二次证据成立：将按 $service 进行专有检查"
+                    check_service_in_container "$cid" "$service" "$img" "$name"
+                else
+                    log "  模糊匹配 $service 但二次证据不足，记录为待人工复核（跳过专有检查）"
+                fi
+                continue
+            fi
+
+            # 精确匹配（非 possible: 前缀）：直接按识别出的服务类型执行专有检查
             check_service_in_container "$cid" "$svc" "$img" "$name"
             continue
         fi
