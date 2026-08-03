@@ -1,0 +1,11 @@
+# 巡检日志（运行产生的日志文件，不提交）
+check_*.log
+logs/
+
+# 临时认证/输出文件
+gh_auth_out.txt
+gh_auth_err.txt
+gh_enter.txt
+
+# 历史备份版本（如需保留请单独管理）
+# bak/
