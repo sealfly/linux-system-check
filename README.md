@@ -2,7 +2,7 @@
 
 一个面向 Linux 服务器的自动化巡检脚本，覆盖系统基础信息、性能、磁盘、网络、应用服务（主机 + Docker）、SSL 证书、日志、安全账号、时间同步等 10 大项检查。任何单项检查失败都不会中断整个巡检（失败则记录并继续下一项）。
 
-> 本仓库为**通用公开版**（`system_check_public.sh`），已移除内部业务专属的检测项，可直接用于任意 Linux 服务器的通用巡检。
+> 本仓库为**通用公开版**（`linux_system_check.sh`），已移除内部业务专属的检测项，可直接用于任意 Linux 服务器的通用巡检。
 
 ## 功能总览
 
@@ -23,13 +23,13 @@
 
 ```bash
 # 添加执行权限
-chmod +x system_check_public.sh
+chmod +x linux_system_check.sh
 
 # 直接运行（普通用户即可，部分检查自动尝试 sudo）
-./system_check_public.sh
+./linux_system_check.sh
 
 # 建议以 root 运行，可获取最完整的巡检结果
-sudo ./system_check_public.sh
+sudo ./linux_system_check.sh
 ```
 
 运行完成后，巡检日志输出到 `LOG_DIR`（默认 `/var/log/system_check/`，不可写时自动回退到当前目录 `./logs/`）。
@@ -58,7 +58,7 @@ sudo ./system_check_public.sh
 
 ```
 .
-├── system_check_public.sh   # 主巡检脚本（通用公开版）
+├── linux_system_check.sh   # 主巡检脚本（通用公开版）
 ├── README.md
 └── .gitignore
 ```
