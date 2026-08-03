@@ -1408,8 +1408,9 @@ detect_service_from_image_or_name() {
         echo "activemq"; return
     fi
     # RocketMQ：镜像/容器名可能带任意前缀（如 rocketmq-nameserver、rocketmq-broker 等），
-    # 关键词覆盖 rocketmq / mqnamesrv / mqbroker / namesrv / broker，确保带前缀也能识别。
-    if echo "$combo" | grep -E -q '(^|[^a-z])(rocketmq|mqnamesrv|mqbroker|namesrv|broker)([^a-z]|$)'; then
+    # 关键词覆盖 rocketmq / mqnamesrv / mqbroker / namesrv / nameserver（RocketMQ 专属词）。
+    # 注意：不使用裸 broker，因为 kafka/rabbitmq 镜像也常叫 xxx-broker，会误伤；rocketmq-broker 由 rocketmq 命中。
+    if echo "$combo" | grep -E -q '(^|[^a-z])(rocketmq|mqnamesrv|mqbroker|namesrv|nameserver)([^a-z]|$)'; then
         echo "rocketmq"; return
     fi
     if echo "$combo" | grep -E -q '(^|[^a-z])(elastic|elasticsearch|\bes\b)([^a-z]|$)'; then
